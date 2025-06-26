@@ -63,6 +63,7 @@ class TorqueTestWizard:
 
     def init_folders(self):
         os.makedirs('lib', exist_ok=True)
+        os.makedirs('lib/preset', exist_ok=True)
         os.makedirs('results', exist_ok=True)
 
     def clear_frame(self):
@@ -91,44 +92,284 @@ class TorqueTestWizard:
         frame = ttk.Frame(self.root, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Connect to Tooltalk Controller (MT6000)", font=("Arial", 16)).pack(pady=10)
+        
+        # Simulation mode toggle
+        simulation_frame = ttk.Frame(frame)
+        simulation_frame.pack(pady=10)
+        
+        simulation_var = tk.BooleanVar()
+        ttk.Checkbutton(simulation_frame, text="Simulation Mode (No Hardware Required)", 
+                       variable=simulation_var,
+                       command=lambda: self.toggle_simulation_mode(simulation_var.get(), connection_frame)).pack()
+        
+        # Connection frame (shown only when not in simulation mode)
+        connection_frame = ttk.Frame(frame)
+        connection_frame.pack(pady=10, fill=tk.X)
+        
+        # COM port detection and selection
+        port_frame = ttk.Frame(connection_frame)
+        port_frame.pack(pady=5, fill=tk.X)
+        
+        ttk.Label(port_frame, text="COM Port:").pack(anchor=tk.W)
+        
         port_var = tk.StringVar(value=self.config['DEFAULT']['com_port'])
-        port_entry = ttk.Entry(frame, textvariable=port_var, width=10)
-        port_entry.pack(pady=5)
-        status_lbl = ttk.Label(frame, text="Not connected", foreground="red")
+        port_combo = ttk.Combobox(port_frame, textvariable=port_var, width=15, state="readonly")
+        port_combo.pack(side=tk.LEFT, padx=(0, 5))
+        
+        def refresh_ports():
+            """Detect and refresh available COM ports"""
+            try:
+                import serial.tools.list_ports
+                ports = [port.device for port in serial.tools.list_ports.comports()]
+                if ports:
+                    port_combo['values'] = ports
+                    if not port_var.get() or port_var.get() not in ports:
+                        port_var.set(ports[0])
+                    status_lbl.config(text=f"Found {len(ports)} COM port(s)", foreground="blue")
+                else:
+                    port_combo['values'] = []
+                    status_lbl.config(text="No COM ports detected", foreground="orange")
+                    messagebox.showwarning("No COM Ports", 
+                        "No COM ports detected.\n\n" +
+                        "If MT6000 appears under USB in Device Manager:\n" +
+                        "1. Right-click on the MT6000 device\n" +
+                        "2. Select 'Update driver'\n" +
+                        "3. Choose 'Browse my computer for drivers'\n" +
+                        "4. Select 'Let me pick from a list'\n" +
+                        "5. Choose 'Ports (COM & LPT)'\n" +
+                        "6. Select appropriate USB Serial driver")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error detecting COM ports: {str(e)}")
+        
+        ttk.Button(port_frame, text="Refresh Ports", command=refresh_ports).pack(side=tk.LEFT)
+        
+        # Initial port detection
+        refresh_ports()
+        
+        status_lbl = ttk.Label(connection_frame, text="Not connected", foreground="red")
         status_lbl.pack(pady=5)
+        
+        # Add test connection button
+        def test_connection():
+            port = port_var.get()
+            if not port:
+                messagebox.showerror("Input Error", "Please select a COM port.")
+                return
+            
+            status_lbl.config(text="Testing connection...", foreground="orange")
+            self.root.update()
+            
+            try:
+                if self.api.test_connection(port):
+                    status_lbl.config(text="Connection verified!", foreground="green")
+                else:
+                    status_lbl.config(text="Connection failed", foreground="red")
+                    messagebox.showerror("Connection Failed", 
+                        f"Could not connect to Tooltalk controller on {port}.\n\n"
+                        "Please check:\n"
+                        "• Device is powered on\n"
+                        "• Correct COM port selected\n"
+                        "• Device is not in use by another application\n"
+                        "• USB-to-serial drivers are properly installed")
+            except Exception as e:
+                status_lbl.config(text="Connection error", foreground="red")
+                messagebox.showerror("Connection Error", f"Error testing connection: {str(e)}")
+        
+        ttk.Button(connection_frame, text="Test Connection", command=test_connection).pack(pady=5)
+        
         def connect():
-            if self.api.connect(port_var.get()):
-                status_lbl.config(text="Connected", foreground="green")
-                self.state['com_port'] = port_var.get()
+            if simulation_var.get():
+                # Simulation mode - skip actual connection
+                status_lbl.config(text="Simulation Mode Active", foreground="blue")
+                self.state['com_port'] = "SIM"
+                self.state['simulation_mode'] = True
                 self.root.after(800, lambda: self.show_step("hole_sample"))
             else:
-                messagebox.showerror("Connection Failed", "Could not connect to controller.")
-        ttk.Button(frame, text="Connect", command=connect).pack(pady=10)
+                # Real mode - verify connection before proceeding
+                port = port_var.get()
+                if not port:
+                    messagebox.showerror("Input Error", "Please select a COM port.")
+                    return
+                
+                status_lbl.config(text="Connecting...", foreground="orange")
+                self.root.update()
+                
+                try:
+                    # First test the connection
+                    if not self.api.test_connection(port):
+                        status_lbl.config(text="Connection failed", foreground="red")
+                        messagebox.showerror("Connection Failed", 
+                            f"Could not establish connection to Tooltalk controller on {port}.\n\n"
+                            "Please verify:\n"
+                            "• Device is powered on and ready\n"
+                            "• Correct COM port is selected\n"
+                            "• Device drivers are installed\n"
+                            "• Device is not being used by another application\n\n"
+                            "If MT6000 appears under USB in Device Manager instead of COM Ports:\n"
+                            "1. Update the device driver to use USB Serial (COM port) driver\n"
+                            "2. Or install Atlas Copco's specific USB driver")
+                        return
+                    
+                    # Then establish the actual connection
+                    if self.api.connect(port):
+                        status_lbl.config(text="Connected and Ready", foreground="green")
+                        self.state['com_port'] = port
+                        self.state['simulation_mode'] = False
+                        # Save the working port to config
+                        self.config['DEFAULT']['com_port'] = port
+                        with open(self.config_file, 'w') as f:
+                            self.config.write(f)
+                        self.root.after(800, lambda: self.show_step("hole_sample"))
+                    else:
+                        status_lbl.config(text="Connection failed", foreground="red")
+                        messagebox.showerror("Connection Failed", 
+                            "Connection test passed but could not establish working connection.\n"
+                            "Please try again or contact technical support.")
+                        
+                except Exception as e:
+                    status_lbl.config(text="Connection error", foreground="red")
+                    messagebox.showerror("Connection Error", f"Error connecting to device: {str(e)}")
+        
+        connect_btn = ttk.Button(frame, text="Connect & Continue", command=connect)
+        connect_btn.pack(pady=10)
+        
+        # Store references for toggling
+        self.connection_frame = connection_frame
+        self.simulation_var = simulation_var
+        
         self.current_frame = frame
+
+    def toggle_simulation_mode(self, is_simulation, connection_frame):
+        if is_simulation:
+            connection_frame.pack_forget()
+        else:
+            connection_frame.pack(pady=10, fill=tk.X)
 
     def show_hole_sample(self):
         frame = ttk.Frame(self.root, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Define Screw Holes and Samples", font=("Arial", 16)).pack(pady=10)
+        
+        # Preset selection
+        use_preset_var = tk.BooleanVar()
+        preset_frame = ttk.Frame(frame)
+        preset_frame.pack(pady=10, fill=tk.X)
+        
+        ttk.Checkbutton(preset_frame, text="Use Preset", variable=use_preset_var, 
+                       command=lambda: self.toggle_preset_mode(use_preset_var.get(), manual_frame, preset_config_frame)).pack(anchor=tk.W)
+        
+        # Preset configuration frame
+        preset_config_frame = ttk.Frame(frame)
+        ttk.Label(preset_config_frame, text="Select Preset:").pack(anchor=tk.W)
+        
+        preset_var = tk.StringVar()
+        preset_combo = ttk.Combobox(preset_config_frame, textvariable=preset_var, 
+                                   values=["scube lid GigE"], state="readonly", width=20)
+        preset_combo.pack(pady=2, anchor=tk.W)
+        preset_combo.set("scube lid GigE")  # Default selection
+        
+        ttk.Label(preset_config_frame, text="Number of samples:").pack(anchor=tk.W, pady=(10, 0))
+        preset_samples_var = tk.IntVar(value=1)
+        ttk.Entry(preset_config_frame, textvariable=preset_samples_var, width=5).pack(pady=2, anchor=tk.W)
+        
+        # Manual configuration frame
+        manual_frame = ttk.Frame(frame)
+        manual_frame.pack(pady=10, fill=tk.X)
+        
         holes_var = tk.IntVar(value=5)
         samples_var = tk.IntVar(value=1)
-        ttk.Label(frame, text="Number of screw holes (A, B, ...):").pack()
-        ttk.Entry(frame, textvariable=holes_var, width=5).pack(pady=2)
-        ttk.Label(frame, text="Number of samples:").pack()
-        ttk.Entry(frame, textvariable=samples_var, width=5).pack(pady=2)
+        ttk.Label(manual_frame, text="Number of screw holes (A, B, ...):").pack(anchor=tk.W)
+        ttk.Entry(manual_frame, textvariable=holes_var, width=5).pack(pady=2, anchor=tk.W)
+        ttk.Label(manual_frame, text="Number of samples:").pack(anchor=tk.W)
+        ttk.Entry(manual_frame, textvariable=samples_var, width=5).pack(pady=2, anchor=tk.W)
+        
         def next_():
-            n = holes_var.get()
-            s = samples_var.get()
-            if n < 1 or s < 1 or n > 26:
-                messagebox.showerror("Input Error", "Number of holes/samples must be 1-26.")
-                return
-            self.state['holes'] = [chr(65+i) for i in range(n)]
-            self.state['samples'] = s
-            self.show_step("image_upload")
-        ttk.Button(frame, text="Next", command=next_).pack(pady=10)
+            if use_preset_var.get():
+                # Handle preset mode
+                preset_name = preset_var.get()
+                samples = preset_samples_var.get()
+                
+                if not preset_name:
+                    messagebox.showerror("Input Error", "Please select a preset.")
+                    return
+                
+                if samples < 1:
+                    messagebox.showerror("Input Error", "Number of samples must be at least 1.")
+                    return
+                
+                # Load preset configuration
+                if preset_name == "scube lid GigE":
+                    preset_files = [
+                        "ace_GigE_Lid_A_B_C_D_G.png",
+                        "ace_GigE_Lid_E_F.png"
+                    ]
+                    holes = ['A', 'B', 'C', 'D', 'E', 'F', 'G']  # All holes for this preset
+                    img_hole_counts = [5, 2]  # First image has 5 holes (A,B,C,D,G), second has 2 (E,F)
+                else:
+                    messagebox.showerror("Error", "Unknown preset selected.")
+                    return
+                
+                # Check if preset files exist
+                preset_dir = "lib/preset"
+                if not os.path.exists(preset_dir):
+                    messagebox.showerror("Error", f"Preset directory '{preset_dir}' not found.")
+                    return
+                
+                image_paths = []
+                for filename in preset_files:
+                    filepath = os.path.join(preset_dir, filename)
+                    if not os.path.exists(filepath):
+                        messagebox.showerror("Error", f"Preset file '{filename}' not found in '{preset_dir}'.")
+                        return
+                    image_paths.append(filepath)
+                
+                # Set state for preset
+                self.state['holes'] = holes
+                self.state['samples'] = samples
+                self.state['images'] = image_paths
+                self.state['img_hole_counts'] = img_hole_counts
+                self.state['using_preset'] = True
+                self.state['preset_name'] = preset_name
+                
+                # Skip image upload and go directly to label placement
+                self.show_step("label_placement")
+            else:
+                # Handle manual mode
+                n = holes_var.get()
+                s = samples_var.get()
+                if n < 1 or s < 1 or n > 26:
+                    messagebox.showerror("Input Error", "Number of holes/samples must be 1-26.")
+                    return
+                self.state['holes'] = [chr(65+i) for i in range(n)]
+                self.state['samples'] = s
+                self.state['using_preset'] = False
+                self.show_step("image_upload")
+        
+        ttk.Button(frame, text="Next", command=next_).pack(pady=20)
+        
+        # Store references for toggling
+        self.preset_config_frame = preset_config_frame
+        self.manual_frame = manual_frame
+        
+        # Initially show manual mode
+        self.toggle_preset_mode(False, manual_frame, preset_config_frame)
+        
         self.current_frame = frame
 
+    def toggle_preset_mode(self, use_preset, manual_frame, preset_config_frame):
+        if use_preset:
+            manual_frame.pack_forget()
+            preset_config_frame.pack(pady=10, fill=tk.X)
+        else:
+            preset_config_frame.pack_forget()
+            manual_frame.pack(pady=10, fill=tk.X)
+
     def show_image_upload(self):
+        # Skip this step if using preset
+        if self.state.get('using_preset', False):
+            self.show_step("label_placement")
+            return
+        
         frame = ttk.Frame(self.root, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Upload Image(s) of Screw Hole Placement", font=("Arial", 16)).pack(pady=10)
@@ -189,6 +430,11 @@ class TorqueTestWizard:
         self.current_frame = frame
 
     def show_label_placement(self):
+        # Skip label placement if using preset (images already have labels)
+        if self.state.get('using_preset', False):
+            self.show_step("torque_setting")
+            return
+            
         frame = ttk.Frame(self.root, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Drag and Drop Labels for Screw Holes", font=("Arial", 16)).pack(pady=10)
@@ -201,7 +447,7 @@ class TorqueTestWizard:
         img_idx = self.state['label_placement_idx']
         img_path = self.state['images'][img_idx]
         pil_img = Image.open(img_path)
-        pil_img = pil_img.resize((500, 400), Image.ANTIALIAS)
+        pil_img = pil_img.resize((500, 400), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(pil_img)
         canvas = Canvas(frame, width=500, height=400, bg="white")
         canvas.pack()
@@ -260,27 +506,74 @@ class TorqueTestWizard:
         ttk.Label(frame, text="Running Test", font=("Arial", 16)).pack(pady=10)
         results = []
         sample_count = self.state['samples']
-        # Collect all hole labels in order of images
-        holes_per_image = [list(d.keys()) for d in self.state['label_positions']]
         torque = self.state['torque']
-        for sample in range(sample_count):
-            messagebox.showinfo("Sample", f"Prepare for sample {sample+1} of {sample_count}")
-            for img_idx, img_path in enumerate(self.state['labeled_images']):
-                pil_img = Image.open(img_path)
-                tk_img = ImageTk.PhotoImage(pil_img)
-                img_win = tk.Toplevel(self.root)
-                img_win.title(f"Sample {sample+1} - Image {img_idx+1}")
-                canvas = Canvas(img_win, width=500, height=400)
-                canvas.pack()
-                canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
-                img_win.tk_img = tk_img
-                positions = self.state['label_positions'][img_idx]
-                for label in holes_per_image[img_idx]:
-                    messagebox.showinfo("Test", f"Place screwdriver at hole {label} (Sample {sample+1}) and press OK to record.")
-                    result = self.api.run_torque_test(label, torque)
-                    result['sample'] = sample+1
-                    results.append(result)
-                img_win.destroy()
+        simulation_mode = self.state.get('simulation_mode', False)
+        
+        # Handle preset vs manual mode differently
+        if self.state.get('using_preset', False):
+            # For presets, use the original preset images and predefined hole order
+            preset_name = self.state['preset_name']
+            if preset_name == "scube lid GigE":
+                # Define holes per image for this preset
+                holes_per_image = [
+                    ['A', 'B', 'C', 'D', 'G'],  # First image: ace_GigE_Lid_A_B_C_D_G.png
+                    ['E', 'F']                   # Second image: ace_GigE_Lid_E_F.png
+                ]
+            else:
+                messagebox.showerror("Error", "Unknown preset configuration.")
+                return
+            
+            for sample in range(sample_count):
+                messagebox.showinfo("Sample", f"Prepare for sample {sample+1} of {sample_count}")
+                for img_idx, img_path in enumerate(self.state['images']):
+                    pil_img = Image.open(img_path)
+                    pil_img = pil_img.resize((500, 400), Image.LANCZOS)
+                    tk_img = ImageTk.PhotoImage(pil_img)
+                    img_win = tk.Toplevel(self.root)
+                    img_win.title(f"Sample {sample+1} - Image {img_idx+1}")
+                    canvas = Canvas(img_win, width=500, height=400)
+                    canvas.pack()
+                    canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+                    img_win.tk_img = tk_img
+                    
+                    # Use predefined holes for this image
+                    for label in holes_per_image[img_idx]:
+                        if simulation_mode:
+                            messagebox.showinfo("Simulation", f"Simulating torque test for hole {label} (Sample {sample+1})")
+                            result = self.api.simulate_torque_test(label, torque)
+                        else:
+                            messagebox.showinfo("Test", f"Place screwdriver at hole {label} (Sample {sample+1}) and press OK to record.")
+                            result = self.api.run_torque_test(label, torque)
+                        result['sample'] = sample+1
+                        results.append(result)
+                    img_win.destroy()
+        else:
+            # For manual mode, use labeled images and positions
+            holes_per_image = [list(d.keys()) for d in self.state['label_positions']]
+            
+            for sample in range(sample_count):
+                messagebox.showinfo("Sample", f"Prepare for sample {sample+1} of {sample_count}")
+                for img_idx, img_path in enumerate(self.state['labeled_images']):
+                    pil_img = Image.open(img_path)
+                    tk_img = ImageTk.PhotoImage(pil_img)
+                    img_win = tk.Toplevel(self.root)
+                    img_win.title(f"Sample {sample+1} - Image {img_idx+1}")
+                    canvas = Canvas(img_win, width=500, height=400)
+                    canvas.pack()
+                    canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+                    img_win.tk_img = tk_img
+                    positions = self.state['label_positions'][img_idx]
+                    for label in holes_per_image[img_idx]:
+                        if simulation_mode:
+                            messagebox.showinfo("Simulation", f"Simulating torque test for hole {label} (Sample {sample+1})")
+                            result = self.api.simulate_torque_test(label, torque)
+                        else:
+                            messagebox.showinfo("Test", f"Place screwdriver at hole {label} (Sample {sample+1}) and press OK to record.")
+                            result = self.api.run_torque_test(label, torque)
+                        result['sample'] = sample+1
+                        results.append(result)
+                    img_win.destroy()
+        
         self.state['results'] = results
         self.save_results_csv()
         self.show_step("show_plot")
@@ -316,7 +609,7 @@ class TorqueTestWizard:
         fig.savefig(plot_path)
         plt.close(fig)
         img = Image.open(plot_path)
-        img = img.resize((500, 400), Image.ANTIALIAS)
+        img = img.resize((500, 400), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(img)
         canvas = Canvas(frame, width=500, height=400)
         canvas.pack()
