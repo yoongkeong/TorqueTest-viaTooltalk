@@ -6,7 +6,9 @@ import os
 import csv
 import shutil
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from tooltalk_api import TooltalkAPI
+from torque_graph import TorqueGraph, TestPhaseDialog
 
 class DragLabel:
     def __init__(self, canvas, label, x, y):
@@ -55,7 +57,12 @@ class TorqueTestWizard:
             self.config['DEFAULT'] = {
                 'com_port': 'COM3',
                 'default_target_torque': '24',
-                'output_directory': 'results'
+                'output_directory': 'results',
+                'enable_live_graphs': 'true',
+                'enable_test_phase': 'true',
+                'controller_ip': '192.168.1.100',
+                'controller_port': '4545',
+                'connection_timeout': '5'
             }
             with open(self.config_file, 'w') as f:
                 self.config.write(f)
@@ -75,6 +82,8 @@ class TorqueTestWizard:
         self.clear_frame()
         if step == "connect":
             self.show_connect()
+        elif step == "test_phase":
+            self.show_test_phase()
         elif step == "hole_sample":
             self.show_hole_sample()
         elif step == "image_upload":
@@ -106,71 +115,62 @@ class TorqueTestWizard:
         connection_frame = ttk.Frame(frame)
         connection_frame.pack(pady=10, fill=tk.X)
         
-        # COM port detection and selection
-        port_frame = ttk.Frame(connection_frame)
-        port_frame.pack(pady=5, fill=tk.X)
+        # IP address configuration
+        ip_frame = ttk.Frame(connection_frame)
+        ip_frame.pack(pady=5, fill=tk.X)
         
-        ttk.Label(port_frame, text="COM Port:").pack(anchor=tk.W)
+        ttk.Label(ip_frame, text="Controller IP Address:").pack(anchor=tk.W)
         
-        port_var = tk.StringVar(value=self.config['DEFAULT']['com_port'])
-        port_combo = ttk.Combobox(port_frame, textvariable=port_var, width=15, state="readonly")
-        port_combo.pack(side=tk.LEFT, padx=(0, 5))
+        ip_var = tk.StringVar(value=self.config['DEFAULT']['controller_ip'])
+        ip_entry = ttk.Entry(ip_frame, textvariable=ip_var, width=20)
+        ip_entry.pack(side=tk.LEFT, padx=(0, 5))
         
-        def refresh_ports():
-            """Detect and refresh available COM ports"""
+        def test_ip_connectivity():
+            """Test IP address connectivity"""
+            ip_address = ip_var.get().strip()
+            if not ip_address:
+                status_lbl.config(text="Please enter an IP address", foreground="orange")
+                return
+            
+            status_lbl.config(text="Testing IP connectivity...", foreground="orange")
+            self.root.update()
+            
             try:
-                import serial.tools.list_ports
-                ports = [port.device for port in serial.tools.list_ports.comports()]
-                if ports:
-                    port_combo['values'] = ports
-                    if not port_var.get() or port_var.get() not in ports:
-                        port_var.set(ports[0])
-                    status_lbl.config(text=f"Found {len(ports)} COM port(s)", foreground="blue")
+                if self.api.test_connection(ip_address):
+                    status_lbl.config(text=f"Controller reachable at {ip_address}", foreground="green")
                 else:
-                    port_combo['values'] = []
-                    status_lbl.config(text="No COM ports detected", foreground="orange")
-                    messagebox.showwarning("No COM Ports", 
-                        "No COM ports detected.\n\n" +
-                        "If MT6000 appears under USB in Device Manager:\n" +
-                        "1. Right-click on the MT6000 device\n" +
-                        "2. Select 'Update driver'\n" +
-                        "3. Choose 'Browse my computer for drivers'\n" +
-                        "4. Select 'Let me pick from a list'\n" +
-                        "5. Choose 'Ports (COM & LPT)'\n" +
-                        "6. Select appropriate USB Serial driver")
+                    status_lbl.config(text=f"Controller not reachable at {ip_address}", foreground="red")
             except Exception as e:
-                messagebox.showerror("Error", f"Error detecting COM ports: {str(e)}")
+                status_lbl.config(text=f"Connection test error: {str(e)}", foreground="red")
         
-        ttk.Button(port_frame, text="Refresh Ports", command=refresh_ports).pack(side=tk.LEFT)
+        ttk.Button(ip_frame, text="Test Connection", command=test_ip_connectivity).pack(side=tk.LEFT)
         
-        # Initial port detection
-        refresh_ports()
-        
+        # Create status label
         status_lbl = ttk.Label(connection_frame, text="Not connected", foreground="red")
         status_lbl.pack(pady=5)
         
-        # Add test connection button
+        # Add test connection button (redundant with IP test, but keeping for compatibility)
         def test_connection():
-            port = port_var.get()
-            if not port:
-                messagebox.showerror("Input Error", "Please select a COM port.")
+            ip_address = ip_var.get().strip()
+            if not ip_address:
+                messagebox.showerror("Input Error", "Please enter an IP address.")
                 return
             
             status_lbl.config(text="Testing connection...", foreground="orange")
             self.root.update()
             
             try:
-                if self.api.test_connection(port):
+                if self.api.test_connection(ip_address):
                     status_lbl.config(text="Connection verified!", foreground="green")
                 else:
                     status_lbl.config(text="Connection failed", foreground="red")
                     messagebox.showerror("Connection Failed", 
-                        f"Could not connect to Tooltalk controller on {port}.\n\n"
+                        f"Could not connect to Tooltalk controller at {ip_address}.\n\n"
                         "Please check:\n"
-                        "• Device is powered on\n"
-                        "• Correct COM port selected\n"
-                        "• Device is not in use by another application\n"
-                        "• USB-to-serial drivers are properly installed")
+                        "• Controller is powered on\n"
+                        "• Correct IP address entered\n"
+                        "• Network connectivity\n"
+                        "• Controller is not in use by another application")
             except Exception as e:
                 status_lbl.config(text="Connection error", foreground="red")
                 messagebox.showerror("Connection Error", f"Error testing connection: {str(e)}")
@@ -183,12 +183,17 @@ class TorqueTestWizard:
                 status_lbl.config(text="Simulation Mode Active", foreground="blue")
                 self.state['com_port'] = "SIM"
                 self.state['simulation_mode'] = True
-                self.root.after(800, lambda: self.show_step("hole_sample"))
+                
+                # Check if test phase is enabled
+                if self.config.getboolean('DEFAULT', 'enable_test_phase', fallback=True):
+                    self.root.after(800, lambda: self.show_step("test_phase"))
+                else:
+                    self.root.after(800, lambda: self.show_step("hole_sample"))
             else:
                 # Real mode - verify connection before proceeding
-                port = port_var.get()
-                if not port:
-                    messagebox.showerror("Input Error", "Please select a COM port.")
+                ip_address = ip_var.get().strip()
+                if not ip_address:
+                    messagebox.showerror("Input Error", "Please enter an IP address.")
                     return
                 
                 status_lbl.config(text="Connecting...", foreground="orange")
@@ -196,30 +201,36 @@ class TorqueTestWizard:
                 
                 try:
                     # First test the connection
-                    if not self.api.test_connection(port):
+                    if not self.api.test_connection(ip_address):
                         status_lbl.config(text="Connection failed", foreground="red")
                         messagebox.showerror("Connection Failed", 
-                            f"Could not establish connection to Tooltalk controller on {port}.\n\n"
+                            f"Could not establish connection to Tooltalk controller at {ip_address}.\n\n"
                             "Please verify:\n"
-                            "• Device is powered on and ready\n"
-                            "• Correct COM port is selected\n"
-                            "• Device drivers are installed\n"
-                            "• Device is not being used by another application\n\n"
-                            "If MT6000 appears under USB in Device Manager instead of COM Ports:\n"
-                            "1. Update the device driver to use USB Serial (COM port) driver\n"
-                            "2. Or install Atlas Copco's specific USB driver")
+                            "• Controller is powered on and ready\n"
+                            "• Correct IP address is entered\n"
+                            "• Network connectivity is working\n"
+                            "• Controller is not being used by another application\n\n"
+                            "Check network settings:\n"
+                            "1. Verify controller IP address in network settings\n"
+                            "2. Ensure controller and PC are on same network\n"
+                            "3. Check firewall settings")
                         return
                     
                     # Then establish the actual connection
-                    if self.api.connect(port):
+                    if self.api.connect(ip_address):
                         status_lbl.config(text="Connected and Ready", foreground="green")
-                        self.state['com_port'] = port
+                        self.state['controller_ip'] = ip_address
                         self.state['simulation_mode'] = False
-                        # Save the working port to config
-                        self.config['DEFAULT']['com_port'] = port
+                        # Save the working IP to config
+                        self.config['DEFAULT']['controller_ip'] = ip_address
                         with open(self.config_file, 'w') as f:
                             self.config.write(f)
-                        self.root.after(800, lambda: self.show_step("hole_sample"))
+                        
+                        # Check if test phase is enabled
+                        if self.config.getboolean('DEFAULT', 'enable_test_phase', fallback=True):
+                            self.root.after(800, lambda: self.show_step("test_phase"))
+                        else:
+                            self.root.after(800, lambda: self.show_step("hole_sample"))
                     else:
                         status_lbl.config(text="Connection failed", foreground="red")
                         messagebox.showerror("Connection Failed", 
@@ -228,7 +239,7 @@ class TorqueTestWizard:
                         
                 except Exception as e:
                     status_lbl.config(text="Connection error", foreground="red")
-                    messagebox.showerror("Connection Error", f"Error connecting to device: {str(e)}")
+                    messagebox.showerror("Connection Error", f"Error connecting to controller: {str(e)}")
         
         connect_btn = ttk.Button(frame, text="Connect & Continue", command=connect)
         connect_btn.pack(pady=10)
@@ -238,6 +249,23 @@ class TorqueTestWizard:
         self.simulation_var = simulation_var
         
         self.current_frame = frame
+
+    def show_test_phase(self):
+        """Show the Test Phase dialog after connection confirmation"""
+        frame = ttk.Frame(self.root, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="Test Phase", font=("Arial", 16)).pack(pady=10)
+        ttk.Label(frame, text="Testing screwdriver trigger and live torque capture...", 
+                 font=("Arial", 12)).pack(pady=10)
+        
+        # Show the test phase dialog
+        simulation_mode = self.state.get('simulation_mode', False)
+        test_dialog = TestPhaseDialog(self.root, self.api, simulation_mode)
+        result = test_dialog.show()
+        
+        # Continue to next step regardless of test result
+        self.show_step("hole_sample")
 
     def toggle_simulation_mode(self, is_simulation, connection_frame):
         if is_simulation:
@@ -546,6 +574,10 @@ class TorqueTestWizard:
                             result = self.api.run_torque_test(label, torque)
                         result['sample'] = sample+1
                         results.append(result)
+                        
+                        # Show live graph if enabled
+                        if self.config.getboolean('DEFAULT', 'enable_live_graphs', fallback=True):
+                            self._show_live_graph_for_test(label, sample+1, result)
                     img_win.destroy()
         else:
             # For manual mode, use labeled images and positions
@@ -572,6 +604,10 @@ class TorqueTestWizard:
                             result = self.api.run_torque_test(label, torque)
                         result['sample'] = sample+1
                         results.append(result)
+                        
+                        # Show live graph if enabled
+                        if self.config.getboolean('DEFAULT', 'enable_live_graphs', fallback=True):
+                            self._show_live_graph_for_test(label, sample+1, result)
                     img_win.destroy()
         
         self.state['results'] = results
@@ -579,10 +615,56 @@ class TorqueTestWizard:
         self.show_step("show_plot")
         self.current_frame = frame
 
+    def _show_live_graph_for_test(self, hole_label, sample_num, result):
+        """Show a live graph for a completed torque test"""
+        try:
+            # Create a simple graph showing the test result
+            graph_window = tk.Toplevel(self.root)
+            graph_window.title(f"Torque Test Result - Hole {hole_label} (Sample {sample_num})")
+            graph_window.geometry("600x400")
+            
+            # Create a simple bar chart showing the result
+            fig, ax = plt.subplots(figsize=(8, 5))
+            
+            # Create a simple visualization of the torque measurement
+            target_torque = result['target_torque']
+            actual_torque = result['actual_torque']
+            
+            # Bar chart
+            bars = ax.bar(['Target', 'Actual'], [target_torque, actual_torque], 
+                         color=['lightblue', 'lightgreen'], alpha=0.7)
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, [target_torque, actual_torque]):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                       f'{value:.1f} Ncm', ha='center', va='bottom')
+            
+            ax.set_ylabel('Torque (Ncm)')
+            ax.set_title(f'Hole {hole_label} - Sample {sample_num}\nTarget: {target_torque:.1f} Ncm, Actual: {actual_torque:.1f} Ncm')
+            ax.grid(True, alpha=0.3)
+            
+            # Add canvas to window
+            canvas = FigureCanvasTkAgg(fig, graph_window)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            
+            # Add close button
+            ttk.Button(graph_window, text="Close", 
+                      command=graph_window.destroy).pack(pady=10)
+            
+            # Auto-close after 5 seconds
+            graph_window.after(5000, graph_window.destroy)
+            
+        except Exception as e:
+            print(f"Error showing live graph: {e}")
+
     def save_results_csv(self):
         results = self.state['results']
         os.makedirs('results', exist_ok=True)
-        filename = f"results/torque_results_{self.state['com_port']}_{self.state['torque']}.csv"
+        # Use IP address or simulation mode identifier for filename
+        connection_id = self.state.get('controller_ip', self.state.get('com_port', 'SIM'))
+        filename = f"results/torque_results_{connection_id}_{self.state['torque']}.csv"
         with open(filename, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['sample', 'hole_label', 'target_torque', 'actual_torque', 'timestamp'])
             writer.writeheader()
@@ -605,7 +687,9 @@ class TorqueTestWizard:
         ax.set_ylabel('Torque (Ncm-1)')
         ax.set_title('Torque Test Results')
         ax.legend()
-        plot_path = f"results/torque_plot_{self.state['com_port']}_{self.state['torque']}.png"
+        # Use IP address or simulation mode identifier for plot filename
+        connection_id = self.state.get('controller_ip', self.state.get('com_port', 'SIM'))
+        plot_path = f"results/torque_plot_{connection_id}_{self.state['torque']}.png"
         fig.savefig(plot_path)
         plt.close(fig)
         img = Image.open(plot_path)

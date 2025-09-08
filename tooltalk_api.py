@@ -1,7 +1,9 @@
 # tooltalk_api.py
 # Abstracts the Tooltalk controller interface for MT6000
 
-import serial
+import socket
+import subprocess
+import platform
 import random
 import datetime
 import time
@@ -10,118 +12,183 @@ import re
 class TooltalkAPI:
     def __init__(self):
         self.connected = False
-        self.serial_connection = None
+        self.socket_connection = None
         # Atlas Copco MT6000 specific settings
-        self.baudrate = 19200  # MT6000 default baudrate
         self.timeout = 3
         self.command_delay = 0.1
+        self.controller_ip = None
+        self.controller_port = 4545  # Default ToolTalk port
     
-    def test_connection(self, port):
-        """Test if the Atlas Copco MT6000 controller is responding on the specified port"""
+    def _ping_host(self, ip_address):
+        """Check if the controller IP is reachable using ping"""
         try:
-            # Try to open the serial connection with MT6000 specific settings
-            test_serial = serial.Serial(
-                port=port,
-                baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=self.timeout,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
-            )
+            # Determine ping command based on OS
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "1", "-w", "3000", ip_address]
+            else:
+                cmd = ["ping", "-c", "1", "-W", "3", ip_address]
             
-            # Clear any existing data
-            test_serial.flushInput()
-            test_serial.flushOutput()
-            time.sleep(0.2)
+            # Execute ping command
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             
-            # Send MT6000 identification command
-            test_serial.write(b'0001 0001 0040 0001\r\n')  # Request system info
-            time.sleep(0.5)
-            
-            response = test_serial.read_all()
-            test_serial.close()
-            
-            # Check if we got a valid MT6000 response
-            if response and len(response) > 0:
-                response_str = response.decode('utf-8', errors='ignore')
-                print(f"Response received: {response_str}")  # Debug output
-                # Look for MT6000 response patterns
-                if any(pattern in response_str.upper() for pattern in ['MT6000', 'ATLAS', '0040', 'OK']):
-                    return True
-            
+            # Check if ping was successful
+            if result.returncode == 0:
+                print(f"Ping successful to {ip_address}")
+                return True
+            else:
+                print(f"Ping failed to {ip_address}: {result.stderr}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"Ping timeout to {ip_address}")
             return False
-            
-        except serial.SerialException as e:
-            print(f"Serial exception: {e}")
+        except Exception as e:
+            print(f"Ping error to {ip_address}: {e}")
             return False
+    
+    def test_connection(self, ip_address):
+        """Test if the Atlas Copco MT6000 controller is responding on the specified IP"""
+        try:
+            # First check network reachability
+            if not self._ping_host(ip_address):
+                print(f"Controller at {ip_address} is not reachable")
+                return False
+            
+            # Try to establish TCP connection
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(self.timeout)
+            
+            try:
+                # Attempt to connect
+                test_socket.connect((ip_address, self.controller_port))
+                print(f"TCP connection established to {ip_address}:{self.controller_port}")
+                
+                # Send MT6000 identification command
+                test_socket.send(b'0001 0001 0040 0001\r\n')
+                time.sleep(0.5)
+                
+                # Try to receive response
+                test_socket.settimeout(2.0)
+                response = test_socket.recv(1024)
+                
+                if response:
+                    response_str = response.decode('utf-8', errors='ignore')
+                    print(f"Response received: {response_str}")
+                    # Look for MT6000 response patterns
+                    if any(pattern in response_str.upper() for pattern in ['MT6000', 'ATLAS', '0040', 'OK']):
+                        test_socket.close()
+                        return True
+                
+                test_socket.close()
+                return False
+                
+            except socket.timeout:
+                print(f"Connection timeout to {ip_address}:{self.controller_port}")
+                test_socket.close()
+                return False
+            except ConnectionRefusedError:
+                print(f"Connection refused by {ip_address}:{self.controller_port}")
+                test_socket.close()
+                return False
+                
         except Exception as e:
             print(f"Connection test error: {e}")
             return False
     
-    def connect(self, port):
-        """Establish connection to the Atlas Copco MT6000 controller"""
+    def connect(self, ip_address):
+        """Establish connection to the Atlas Copco MT6000 controller via TCP/IP"""
         try:
-            if self.serial_connection:
-                self.serial_connection.close()
+            # Store IP address for later use
+            self.controller_ip = ip_address
             
-            self.serial_connection = serial.Serial(
-                port=port,
-                baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=self.timeout,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
-            )
+            # Close existing connection if any
+            if self.socket_connection:
+                self.socket_connection.close()
             
-            # Clear buffers
-            self.serial_connection.flushInput()
-            self.serial_connection.flushOutput()
-            time.sleep(0.2)
+            # First check network reachability
+            if not self._ping_host(ip_address):
+                print(f"Cannot connect: Controller at {ip_address} is not reachable")
+                return False
+            
+            # Create TCP socket connection
+            self.socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket_connection.settimeout(self.timeout)
+            
+            # Connect to the controller
+            self.socket_connection.connect((ip_address, self.controller_port))
+            print(f"Connected to controller at {ip_address}:{self.controller_port}")
             
             # Initialize MT6000 controller
             # Set controller to remote mode
-            self.serial_connection.write(b'0001 0002 0042 0001\r\n')  # Enable remote control
+            self.socket_connection.send(b'0001 0002 0042 0001\r\n')  # Enable remote control
             time.sleep(self.command_delay)
             
             # Read response
             response = self._read_response()
             if response and 'OK' in response:
                 self.connected = True
+                print(f"Controller initialized successfully at {ip_address}")
                 return True
             else:
                 print(f"Initialization failed. Response: {response}")
+                self.socket_connection.close()
+                self.socket_connection = None
                 return False
             
+        except socket.timeout:
+            print(f"Connection timeout to {ip_address}:{self.controller_port}")
+            self.connected = False
+            if self.socket_connection:
+                self.socket_connection.close()
+                self.socket_connection = None
+            return False
+        except ConnectionRefusedError:
+            print(f"Connection refused by {ip_address}:{self.controller_port}")
+            self.connected = False
+            if self.socket_connection:
+                self.socket_connection.close()
+                self.socket_connection = None
+            return False
         except Exception as e:
             print(f"Connection error: {e}")
             self.connected = False
-            if self.serial_connection:
-                self.serial_connection.close()
-                self.serial_connection = None
+            if self.socket_connection:
+                self.socket_connection.close()
+                self.socket_connection = None
             return False
     
     def _read_response(self):
-        """Read response from MT6000 controller"""
+        """Read response from MT6000 controller via TCP socket"""
         try:
+            if not self.socket_connection:
+                return ""
+            
+            # Set socket timeout for reading
+            self.socket_connection.settimeout(self.timeout)
+            
             response = b''
             start_time = time.time()
             
             while time.time() - start_time < self.timeout:
-                if self.serial_connection.in_waiting > 0:
-                    chunk = self.serial_connection.read(self.serial_connection.in_waiting)
-                    response += chunk
-                    
-                    # Check if we have a complete response (ends with \r\n)
-                    if b'\r\n' in response:
+                try:
+                    # Try to receive data
+                    chunk = self.socket_connection.recv(1024)
+                    if chunk:
+                        response += chunk
+                        
+                        # Check if we have a complete response (ends with \r\n)
+                        if b'\r\n' in response:
+                            break
+                    else:
+                        # No more data available
                         break
-                
-                time.sleep(0.01)
+                        
+                except socket.timeout:
+                    # Timeout waiting for data
+                    break
+                except Exception as e:
+                    print(f"Error receiving data: {e}")
+                    break
             
             return response.decode('utf-8', errors='ignore').strip()
         
@@ -132,12 +199,16 @@ class TooltalkAPI:
     def set_torque_target(self, target_torque):
         """Set target torque on MT6000 controller"""
         try:
+            if not self.socket_connection or not self.connected:
+                print("Not connected to controller")
+                return False
+                
             # Convert torque to MT6000 format (usually in cNm - centinewton meters)
             torque_cnm = int(target_torque * 100)  # Convert Nm to cNm
             
             # Format torque command for MT6000
             command = f'0001 0014 0043 {torque_cnm:04d}\r\n'
-            self.serial_connection.write(command.encode())
+            self.socket_connection.send(command.encode())
             time.sleep(self.command_delay)
             
             response = self._read_response()
@@ -149,7 +220,7 @@ class TooltalkAPI:
     
     def run_torque_test(self, hole_label, target_torque):
         """Execute actual torque test with MT6000 hardware"""
-        if not self.connected or not self.serial_connection:
+        if not self.connected or not self.socket_connection:
             raise Exception("Not connected to controller")
         
         try:
@@ -158,7 +229,7 @@ class TooltalkAPI:
                 raise Exception("Failed to set target torque")
             
             # Start tightening cycle
-            self.serial_connection.write(b'0001 0018 0041 0001\r\n')  # Start cycle
+            self.socket_connection.send(b'0001 0018 0041 0001\r\n')  # Start cycle
             time.sleep(self.command_delay)
             
             # Wait for cycle completion and read result
@@ -167,7 +238,7 @@ class TooltalkAPI:
             
             while time.time() - start_time < max_wait_time:
                 # Request last result
-                self.serial_connection.write(b'0001 0033 0200\r\n')  # Request last tightening result
+                self.socket_connection.send(b'0001 0033 0200\r\n')  # Request last tightening result
                 time.sleep(0.5)
                 
                 response = self._read_response()
@@ -229,14 +300,15 @@ class TooltalkAPI:
     def disconnect(self):
         """Clean disconnect from controller"""
         try:
-            if self.serial_connection and self.connected:
+            if self.socket_connection and self.connected:
                 # Disable remote control
-                self.serial_connection.write(b'0001 0002 0042 0000\r\n')
+                self.socket_connection.send(b'0001 0002 0042 0000\r\n')
                 time.sleep(self.command_delay)
                 
-            if self.serial_connection:
-                self.serial_connection.close()
-                self.serial_connection = None
+            if self.socket_connection:
+                self.socket_connection.close()
+                self.socket_connection = None
+                print(f"Disconnected from controller at {self.controller_ip}")
         except Exception as e:
             print(f"Error during disconnect: {e}")
         finally:
